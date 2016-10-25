@@ -1,10 +1,10 @@
 var Promise = require('promise');
 var colors = require('colors');
 var superagent = require('superagent');
-var parse = require('csv-parse/lib/sync');
-var fs = require("fs");
-var readFile = Promise.denodeify(fs.readFile);
-var writeFile = Promise.denodeify(fs.writeFile);
+var parse = require('csv-parse');
+var transform = require('stream-transform');
+var fs = require('fs');
+var util = require('util');
 
 var ghUser =  process.env.GH_USER;
 var ghPwd =  process.env.GH_PWD;
@@ -42,58 +42,37 @@ function getBasicRequest(repo){
     });
 }
 
-
-function onRecords(records){
-  var upperBound = records.length;
-  var cache = {};
-  var bad_repos = {};
-  return Promise.resolve(0).then(function traverse(index){
-    console.log("Step %s of %s", index+1, upperBound);
-    if(index === upperBound)
-      return Promise.resolve(cache);
-    var repo = records[index].repo;
-    if(bad_repos.hasOwnProperty(repo)){
-      console.log("bad repo %s", repo);
-      return traverse(index + 1);
-    }
-    if(cache.hasOwnProperty(repo)){
-      console.log("repo %s has been handled already", repo);
-      return traverse(index + 1);
-    }
-    return getBasicRequest(repo).then(function done(response){
-      cache[repo] = {
-        forks_count : response.body.forks,
-        stargazers_count : response.body.stargazers_count,
-        watchers_count : response.body.watchers,
-        size : response.body.size
-      }
-      return traverse(index + 1);
-    }, function fail(err){
+var parser = parse({delimiter: ','});
+var input = fs.createReadStream(__dirname+'/react_deps.csv');
+var output = fs.createWriteStream(__dirname + '/repos.csv');
+var isHeader = true, repos={}, step=0;
+var transformer = transform(function(record, callback){
+  if(isHeader){
+    isHeader = false;
+    return callback(null, "repo,stars,forks,watchers,size\n");
+  }
+  console.log(colors.green("step #" + ++step));
+  var repo = record[0];
+  if(repos.hasOwnProperty(repo))
+    return callback();
+  repos[repo] = 1;
+  (function core(){
+    getBasicRequest(repo).then(function done(response){
+      var body = response.body;
+      var row = util.format("%s,%d,%d,%d,%d\n",repo, body.stargazers_count, body.forks, body.watchers, body.size)
+      callback(null, row);
+    }, function(err){
       if(err.status===403){
         var restoringTime = (+err.header['x-ratelimit-reset']) * 1000;
         var waitTime = restoringTime - Date.now();
         console.log(colors.red('please wait for ' + waitTime + 'ms'));
-        return wait(waitTime).then(()=>traverse(index));
+        wait(waitTime).then(core);
       }
       else{
-        bad_repos[repo] = 1;
         console.log("error on repo %s : %s", repo, err);
-        return traverse(index + 1);
+        callback();
       }
-    })
-  })
-}
-
-var onError = (err)=>console.log(colors.red("error %s occurred", err));
-
-readFile(__dirname+'/react_deps')
-.then(content=>onRecords(parse(content, {columns : true})), onError)
-.then(function done(repos_data){
-  var data = Object.keys(repos_data).map(function(key){
-    return Object.assign({repo : key}, repos_data[key]);
-  })
-  return writeFile(__dirname + "/repos.json", JSON.stringify(data));
-}, onError)
-.then(function(){
-  console.log("we are done");
-}, onError);
+    });
+  })();
+}, {parallel: 1});
+input.pipe(parser).pipe(transformer).pipe(output);
